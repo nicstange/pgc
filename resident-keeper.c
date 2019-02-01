@@ -706,14 +706,7 @@ static int resident_keeper_refresh_one(void *p, void *arg)
 
 		for (i_page_in_range = 0;
 		     i_page_in_range < r->n_pages && i_page < n_pages;
-		     (++i_page_in_range, ++i_page,
-		      ++s->n_pages_refreshed_since_yield)) {
-			if (s->n_pages_refreshed_since_yield == 1u << 18) {
-				pthread_testcancel();
-				/* pthread_yield(); */
-				s->n_pages_refreshed_since_yield = 0;
-			}
-
+		     (++i_page_in_range, ++i_page)) {
 			refresh_page((char*)m->map + r->offset, i_page_in_range,
 				     s->page_size);
 		}
@@ -730,8 +723,6 @@ static void *resident_keeper_refresh_proc(void *arg)
 	unsigned long avg_duration_ms; /* moving average */
 	const unsigned int avg_window_len = 32;
 	unsigned int n_since_last_printed;
-
-	s->n_pages_refreshed_since_yield = 0;
 
 	avg_duration_ms = 0;
 	n_since_last_printed = 0;
@@ -791,15 +782,7 @@ static int resident_keeper_warmup_one(void *p, void *arg)
 
 		for (i_page_in_range = 0;
 		     i_page_in_range < r->n_pages && i_page < n_pages;
-		     (++i_page_in_range, ++i_page,
-		      ++s->n_pages_warmed_up_since_yield)) {
-			if (s->n_pages_warmed_up_since_yield == 1u << 8) {
-				pthread_testcancel();
-				/* pthread_yield(); */
-				s->n_pages_warmed_up_since_yield = 0;
-			}
-
-			usleep(120);
+		     (++i_page_in_range, ++i_page)) {
 			refresh_page((char*)m->map + r->offset, i_page_in_range,
 				     s->page_size);
 
@@ -819,9 +802,6 @@ static void resident_keeper_warmup(struct resident_keeper_state *s)
 {
 	struct timespec ts_start, ts_end;
 	unsigned long duration_ms;
-
-	s->n_pages_warmed_up_since_yield = 0;
-
 
 	clock_gettime(CLOCK_MONOTONIC, &ts_start);
 	s->i_page = 0;

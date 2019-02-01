@@ -60,8 +60,6 @@ struct resident_keeper_state
 	size_t mincore_buf_size;
 
 	pthread_t refresher;
-	unsigned int n_pages_refreshed_since_yield;
-	unsigned int n_pages_warmed_up_since_yield;
 };
 
 
