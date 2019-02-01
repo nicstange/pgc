@@ -22,6 +22,9 @@ static const struct option longopts[] = {
 	{ "resident-set-directory", 1, NULL, 'd' },
 	{ "resident-set-fillup-file", 1, NULL, 'f' },
 	{ "map-resident-executable", 0, NULL, 'R' },
+	{ "refresh-only-resident", 0, NULL, 'q' },
+	{ "launch-resident-rewarmer", 0, NULL, 'w' },
+	{ "rt-sched-refresher", 0, NULL, 'c' },
 
 	{ "transient-pool-file", 1, NULL, 't' },
 	{ "transient-refill-period", 1, NULL, 'p' },
@@ -37,13 +40,16 @@ static const struct option longopts[] = {
 	{ NULL, 0, NULL, 0}
 };
 
-static const char optstring[] = ":r:d:f:Ra:t:p:Tv:Vh";
+static const char optstring[] = ":r:d:f:Rqwca:t:p:Tv:Vh";
 
 static size_t resident_set_size;
 static const char **resident_set_directories;
 static const char *resident_set_fillup_file;
 static size_t n_resident_set_directories;
 static bool map_resident_exec;
+static bool refresh_only_resident;
+static bool launch_resident_rewarmer;
+static bool rt_sched_refresher;
 
 static const char *transient_pool_file;
 static unsigned long transient_refill_period_usec;
@@ -333,6 +339,18 @@ int main(int argc, char *argv[])
 			map_resident_exec = true;
 			break;
 
+		case 'q':
+			refresh_only_resident = true;
+			break;
+
+		case 'w':
+			launch_resident_rewarmer = true;
+			break;
+
+		case 'c':
+			rt_sched_refresher = true;
+			break;
+
 		case 't':
 			if (transient_pool_file) {
 				r = set_err_msg(&err_msg,
@@ -530,7 +548,10 @@ int main(int argc, char *argv[])
 
 		n_target_pages = resident_set_size / page_size;
 		if (resident_keeper_state_init(&rks, n_target_pages,
-					       map_resident_exec)) {
+					       map_resident_exec,
+					       refresh_only_resident,
+					       launch_resident_rewarmer,
+					       rt_sched_refresher)) {
 			perror(ME);
 			if (transient_pool_file)
 				transient_pager_state_cleanup(&tps);
@@ -556,6 +577,10 @@ int main(int argc, char *argv[])
 			}
 		}
 
+		if (n_resident_set_directories) {
+			printf("Searching for resident files...\n");
+			fflush(stdout);
+		}
 		for (i = 0; i < n_resident_set_directories; ++i) {
 			const char *d = resident_set_directories[i];
 

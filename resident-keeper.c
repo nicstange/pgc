@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <sched.h>
+#include <assert.h>
 #include "resident-keeper.h"
 #include "util.h"
 #include "sigbus-fixup.h"
@@ -376,7 +377,10 @@ static int resident_mapping_comp_id(struct rb_node *node, void *data)
 
 
 int resident_keeper_state_init(struct resident_keeper_state *s,
-			       size_t target_n_pages, bool map_executable)
+			       size_t target_n_pages, bool map_executable,
+			       bool refresh_only_resident,
+			       bool launch_rewarmer,
+			       bool rt_sched_refresher)
 {
 	int r;
 	long page_size;
@@ -413,9 +417,58 @@ int resident_keeper_state_init(struct resident_keeper_state *s,
 	}
 	s->mincore_buf_size = page_size;
 
+	if (launch_rewarmer) {
+		s->rewarm_ring =
+			(void **)mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+				      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (s->rewarm_ring == MAP_FAILED) {
+			munmap(s->mincore_buf, s->mincore_buf_size);
+			heap_destroy(&s->mappings);
+			return -1;
+		}
+		s->rewarm_ring_size = page_size / sizeof(void *);
+
+		r = pthread_spin_init(&s->rewarm_ring_lock,
+				      PTHREAD_PROCESS_PRIVATE);
+		if (r) {
+			munmap(s->rewarm_ring,
+			       s->rewarm_ring_size * sizeof(void *));
+			munmap(s->mincore_buf, s->mincore_buf_size);
+			heap_destroy(&s->mappings);
+			errno = r;
+			return -1;
+		}
+
+		r = pthread_mutex_init(&s->rewarmer_wake_mtx, NULL);
+		if (r) {
+			pthread_spin_destroy(&s->rewarm_ring_lock);
+			munmap(s->rewarm_ring,
+			       s->rewarm_ring_size * sizeof(void *));
+			munmap(s->mincore_buf, s->mincore_buf_size);
+			heap_destroy(&s->mappings);
+			errno = r;
+			return -1;
+		}
+
+		r = pthread_cond_init(&s->rewarmer_wake_cond, NULL);
+		if (r) {
+			pthread_mutex_destroy(&s->rewarmer_wake_mtx);
+			pthread_spin_destroy(&s->rewarm_ring_lock);
+			munmap(s->rewarm_ring,
+			       s->rewarm_ring_size * sizeof(void *));
+			munmap(s->mincore_buf, s->mincore_buf_size);
+			heap_destroy(&s->mappings);
+			errno = r;
+			return -1;
+		}
+	}
+
 	s->page_size = page_size;
 	s->target_n_pages = target_n_pages;
 	s->map_executable = map_executable;
+	s->refresh_only_resident = refresh_only_resident;
+	s->launch_rewarmer = launch_rewarmer;
+	s->rt_sched_refresher = rt_sched_refresher;
 
 	return 0;
 }
@@ -432,6 +485,12 @@ static int resident_keeper_state_cleanup_one(void *p, void *arg)
 
 void resident_keeper_state_cleanup(struct resident_keeper_state *s)
 {
+	if (s->launch_rewarmer) {
+		pthread_cond_destroy(&s->rewarmer_wake_cond);
+		pthread_mutex_destroy(&s->rewarmer_wake_mtx);
+		pthread_spin_destroy(&s->rewarm_ring_lock);
+		munmap(s->rewarm_ring, s->rewarm_ring_size * sizeof(void *));
+	}
 	munmap(s->mincore_buf, s->mincore_buf_size);
 	heap_for_each(&s->mappings, resident_keeper_state_cleanup_one,
 		      NULL);
@@ -664,6 +723,175 @@ int resident_keeper_set_fillup_file(struct resident_keeper_state *s,
 	return 0;
 }
 
+static void try_add_rewarm_page(struct resident_keeper_state *s, void *p)
+{
+	int r;
+	size_t pos, used;
+
+	if (!s->launch_rewarmer)
+		return;
+
+	used = __atomic_load_n(&s->rewarm_ring_used, __ATOMIC_RELAXED);
+	if (used == s->rewarm_ring_size)
+		return;
+
+	r = pthread_spin_lock(&s->rewarm_ring_lock);
+	assert(!r);
+
+	used = s->rewarm_ring_used;
+	if (used == s->rewarm_ring_size) {
+		pthread_spin_unlock(&s->rewarm_ring_lock);
+		return;
+	}
+
+	pos = s->rewarm_ring_pos + used;
+	if (pos >= s->rewarm_ring_size)
+		pos -= s->rewarm_ring_size;
+
+	s->rewarm_ring[pos] = p;
+	++used;
+	s->rewarm_ring_used = used;
+	pthread_spin_unlock(&s->rewarm_ring_lock);
+	if (used != 1)
+		return;
+
+	r = pthread_mutex_lock(&s->rewarmer_wake_mtx);
+	assert(!r);
+	r = pthread_cond_signal(&s->rewarmer_wake_cond);
+	assert(!r);
+	pthread_mutex_unlock(&s->rewarmer_wake_mtx);
+}
+
+static void* rewarmer_proc(void *arg)
+{
+	struct resident_keeper_state *s = (struct resident_keeper_state *)arg;
+	void *p;
+	int r;
+	size_t used;
+
+	while (1) {
+		p = NULL;
+		pthread_testcancel();
+		r = pthread_spin_lock(&s->rewarm_ring_lock);
+		assert(!r);
+		used = s->rewarm_ring_used;
+		if (used) {
+			p = s->rewarm_ring[s->rewarm_ring_pos];
+			s->rewarm_ring_pos++;
+			if (s->rewarm_ring_pos == s->rewarm_ring_size)
+				s->rewarm_ring_pos = 0;
+
+			__atomic_store_n(&s->rewarm_ring_used,
+					 used - 1, __ATOMIC_RELAXED);
+		}
+		pthread_spin_unlock(&s->rewarm_ring_lock);
+
+		if (p) {
+			sigbus_fixup.active = true;
+			if (setjmp(sigbus_fixup.jmp_buf))
+				continue;
+
+			refresh_page(p, 0, s->page_size);
+			sigbus_fixup.active = false;
+			continue;
+		}
+
+		pthread_mutex_lock(&s->rewarmer_wake_mtx);
+		r = pthread_spin_lock(&s->rewarm_ring_lock);
+		if (s->rewarm_ring_used) {
+			pthread_spin_unlock(&s->rewarm_ring_lock);
+			pthread_mutex_unlock(&s->rewarmer_wake_mtx);
+			continue;
+		}
+		pthread_spin_unlock(&s->rewarm_ring_lock);
+
+		if (s->quit_rewarmer) {
+			pthread_mutex_unlock(&s->rewarmer_wake_mtx);
+			break;
+		}
+
+		r = pthread_cond_wait(&s->rewarmer_wake_cond,
+				      &s->rewarmer_wake_mtx);
+		assert(!r);
+		pthread_mutex_unlock(&s->rewarmer_wake_mtx);
+	}
+
+	return NULL;
+}
+
+static size_t refresh_range(struct resident_keeper_state *s,
+			    struct resident_mapping *m,
+			    struct resident_range *rr,
+			    size_t n_pages)
+{
+	size_t mincore_count;
+	size_t i_page;
+	size_t n_pages_found_resident;
+	void *map = (char *)m->map + rr->offset;
+
+	if (n_pages > rr->n_pages)
+		n_pages = rr->n_pages;
+
+	/*
+	 * Do not query too many pages at once, otherwise
+	 * the information will become more likely to be stale.
+	 */
+	mincore_count = s->mincore_buf_size > 64 ? 64 : s->mincore_buf_size;
+
+	i_page = 0;
+	n_pages_found_resident = 0;
+	while (n_pages) {
+		size_t n_pages_in_batch, i_page_in_batch;
+		size_t _i_page;
+		int r;
+
+		n_pages_in_batch = (mincore_count < n_pages
+				    ? mincore_count : n_pages);
+		_i_page = i_page;
+		i_page += n_pages_in_batch;
+		n_pages -= n_pages_in_batch;
+
+		r = mincore((char *)map + _i_page * s->page_size,
+			    n_pages_in_batch * s->page_size, s->mincore_buf);
+
+		if (s->refresh_only_resident) {
+			if (r)
+				continue;
+
+			for (i_page_in_batch = 0;
+			     i_page_in_batch < n_pages_in_batch;
+			     ++i_page_in_batch) {
+				if (s->mincore_buf[i_page_in_batch] & 0x01) {
+					refresh_page(map,
+						     _i_page + i_page_in_batch,
+						     s->page_size);
+					++n_pages_found_resident;
+				} else {
+					try_add_rewarm_page
+						(s,
+						 ((char *)map +
+						  (_i_page + i_page_in_batch) *
+						  s->page_size));
+				}
+			}
+
+		} else {
+			for (i_page_in_batch = 0;
+			     i_page_in_batch < n_pages_in_batch;
+			     ++i_page_in_batch) {
+				refresh_page(map, _i_page + i_page_in_batch,
+					     s->page_size);
+				if (!r &&
+				    (s->mincore_buf[i_page_in_batch] & 0x01)) {
+					++n_pages_found_resident;
+				}
+			}
+		}
+	}
+
+	return n_pages_found_resident;
+}
+
 static int resident_keeper_refresh_one(void *p, void *arg)
 {
 	int r;
@@ -674,7 +902,6 @@ static int resident_keeper_refresh_one(void *p, void *arg)
 
 	size_t n_pages = (active_n_pages - s->i_page > m->n_pages ?
 			  m->n_pages : active_n_pages - s->i_page);
-	size_t i_page;
 	size_t i_resident_range;
 
 	r = 1;
@@ -696,20 +923,17 @@ static int resident_keeper_refresh_one(void *p, void *arg)
 		return r;
 	}
 
-	for (i_resident_range = 0, i_page = 0;
-	     (i_resident_range < m->n_resident_ranges &&
-	      i_page < n_pages);
+	for (i_resident_range = 0; i_resident_range < m->n_resident_ranges;
 	     ++i_resident_range) {
 		struct resident_range *r =
 			resident_mapping_get_range(m, i_resident_range);
-		size_t i_page_in_range;
+		s->n_pages_found_resident +=
+			refresh_range(s, m, r, n_pages);
 
-		for (i_page_in_range = 0;
-		     i_page_in_range < r->n_pages && i_page < n_pages;
-		     (++i_page_in_range, ++i_page)) {
-			refresh_page((char*)m->map + r->offset, i_page_in_range,
-				     s->page_size);
-		}
+		if (n_pages > r->n_pages)
+			n_pages -= r->n_pages;
+		else
+			break;
 	}
 
 	sigbus_fixup.active = false;
@@ -720,33 +944,52 @@ static int resident_keeper_refresh_one(void *p, void *arg)
 static void *resident_keeper_refresh_proc(void *arg)
 {
 	struct resident_keeper_state *s = (struct resident_keeper_state *)arg;
-	unsigned long avg_duration_ms; /* moving average */
-	const unsigned int avg_window_len = 32;
-	unsigned int n_since_last_printed;
+	unsigned long n_acc;
+	unsigned long acc_duration_ms;
+	size_t acc_n_pages_found_resident;
 
-	avg_duration_ms = 0;
-	n_since_last_printed = 0;
+	n_acc = 0;
+	acc_duration_ms = 0;
+	acc_n_pages_found_resident = 0;
 	while (true) {
 		struct timespec ts_start, ts_end;
 		unsigned long duration_ms;
 
 		clock_gettime(CLOCK_MONOTONIC, &ts_start);
 		s->i_page = 0;
+		s->n_pages_found_resident = 0;
 		heap_for_each(&s->mappings, resident_keeper_refresh_one, s);
-		if (s->fillup_mapping.map && s->i_page < __atomic_load_n(&s->active_n_pages, __ATOMIC_RELAXED))
+		if (s->fillup_mapping.map &&
+		    (s->i_page <
+		     __atomic_load_n(&s->active_n_pages, __ATOMIC_RELAXED))) {
 			resident_keeper_refresh_one(&s->fillup_mapping, s);
+		}
 		clock_gettime(CLOCK_MONOTONIC, &ts_end);
 
+		++n_acc;
 		duration_ms = ts_diff_ms(&ts_start, &ts_end);
-		avg_duration_ms = ((avg_duration_ms >> 1) +
-				   (duration_ms << (avg_window_len - 1)));
-		if (++n_since_last_printed == avg_window_len) {
-			n_since_last_printed = 0;
-			printf("Refreshing %lu resident pages takes %lums\n",
-				__atomic_load_n(&s->active_n_pages, __ATOMIC_RELAXED),
-			       ((avg_duration_ms +
-				 ((1ul << avg_window_len) - 1) / 2) /
-				((1ul << avg_window_len) - 1)));
+		acc_duration_ms += duration_ms;
+		acc_n_pages_found_resident += s->n_pages_found_resident;
+
+		if (acc_duration_ms >= 500) {
+			unsigned long avg_duration_ms;
+			size_t n_active_pages;
+			unsigned long avg_n_pages_found_resident;
+
+			avg_duration_ms =
+				(acc_duration_ms + (n_acc / 2)) / n_acc;
+			n_active_pages = __atomic_load_n(&s->active_n_pages,
+							 __ATOMIC_RELAXED);
+			avg_n_pages_found_resident =
+				((acc_n_pages_found_resident + (n_acc / 2)) /
+				 n_acc);
+			printf("Refresh resident: %lums, active %lu, resident %lu\n",
+			       avg_duration_ms, n_active_pages,
+			       avg_n_pages_found_resident);
+
+			n_acc = 0;
+			acc_duration_ms = 0;
+			acc_n_pages_found_resident = 0;
 		}
 	}
 
@@ -818,40 +1061,55 @@ int resident_keeper_start(struct resident_keeper_state *s)
 {
 	int r;
 
-	/* pthread_attr_t attr; */
-	/* struct sched_param sp = { .sched_priority = sched_get_priority_max(SCHED_FIFO) }; */
+	pthread_attr_t attr;
+	struct sched_param sp = { };
 
-	/* r = pthread_attr_init(&attr); */
-	/* if (r) { */
-	/* 	errno = r; */
-	/* 	return -1; */
-	/* } */
-
-	/* r = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED); */
-	/* if (r) { */
-	/* 	errno = r; */
-	/* 	return -1; */
-	/* } */
-
-	/* r = pthread_attr_setschedpolicy(&attr, SCHED_FIFO); */
-	/* if (r) { */
-	/* 	errno = r; */
-	/* 	return -1; */
-	/* } */
-
-	/* r = pthread_attr_setschedparam(&attr, &sp); */
-	/* if (r) { */
-	/* 	errno = r; */
-	/* 	return -1; */
-	/* } */
-
-	/* r = pthread_create(&s->refresher, &attr, */
-	/* 		   resident_keeper_refresh_proc, s); */
-	r = pthread_create(&s->refresher, NULL,
-			   resident_keeper_refresh_proc, s);
+	r = pthread_attr_init(&attr);
 	if (r) {
 		errno = r;
 		return -1;
+	}
+
+	if (s->rt_sched_refresher) {
+		r = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+		if (r) {
+			pthread_attr_destroy(&attr);
+			errno = r;
+			return -1;
+		}
+
+		r = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+		if (r) {
+			pthread_attr_destroy(&attr);
+			errno = r;
+			return -1;
+		}
+
+		sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
+		r = pthread_attr_setschedparam(&attr, &sp);
+		if (r) {
+			pthread_attr_destroy(&attr);
+			errno = r;
+			return -1;
+		}
+	}
+
+	r = pthread_create(&s->refresher, &attr,
+			   resident_keeper_refresh_proc, s);
+	pthread_attr_destroy(&attr);
+	if (r) {
+		errno = r;
+		return -1;
+	}
+
+	if (s->launch_rewarmer) {
+		r = pthread_create(&s->rewarmer, NULL, rewarmer_proc, s);
+		if (r) {
+			pthread_cancel(s->refresher);
+			pthread_join(s->refresher, NULL);
+			errno = r;
+			return -1;
+		}
 	}
 
 	resident_keeper_warmup(s);
@@ -861,6 +1119,14 @@ int resident_keeper_start(struct resident_keeper_state *s)
 
 void resident_keeper_stop(struct resident_keeper_state *s)
 {
+	if (s->launch_rewarmer) {
+		pthread_cancel(s->rewarmer);
+		pthread_mutex_lock(&s->rewarmer_wake_mtx);
+		s->quit_rewarmer = true;
+		pthread_cond_signal(&s->rewarmer_wake_cond);
+		pthread_mutex_unlock(&s->rewarmer_wake_mtx);
+		pthread_join(s->rewarmer, NULL);
+	}
 	pthread_cancel(s->refresher);
 	pthread_join(s->refresher, NULL);
 }

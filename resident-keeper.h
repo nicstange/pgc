@@ -46,25 +46,42 @@ struct resident_keeper_state
 
 	size_t i_page;
 	size_t active_n_pages;
-	size_t target_n_pages;
+	size_t n_pages_found_resident;
 
 	size_t page_size;
 
 	struct rb_node *id_tree_root;
+	size_t target_n_pages;
 	size_t n_pages;
 	size_t n_pages_executable;
 
 	bool map_executable;
+	bool refresh_only_resident;
+	bool launch_rewarmer;
+	bool rt_sched_refresher;
 
 	unsigned char *mincore_buf;
 	size_t mincore_buf_size;
 
 	pthread_t refresher;
+
+	void **rewarm_ring;
+	size_t rewarm_ring_size;
+	pthread_spinlock_t rewarm_ring_lock;
+	size_t rewarm_ring_used;
+	size_t rewarm_ring_pos;
+	pthread_mutex_t rewarmer_wake_mtx;
+	pthread_cond_t rewarmer_wake_cond;
+	bool quit_rewarmer;
+	pthread_t rewarmer;
 };
 
 
 int resident_keeper_state_init(struct resident_keeper_state *s,
-			       size_t target_n_pages, bool map_executable);
+			       size_t target_n_pages, bool map_executable,
+			       bool refresh_only_resident,
+			       bool launch_rewarmer,
+			       bool rt_sched_refresher);
 void resident_keeper_state_cleanup(struct resident_keeper_state *s);
 int resident_keeper_scan_directory(struct resident_keeper_state *s,
 				   const char *path);
