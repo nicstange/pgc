@@ -845,7 +845,7 @@ static size_t refresh_range(struct resident_keeper_state *s,
 	 * Do not query too many pages at once, otherwise
 	 * the information will become more likely to be stale.
 	 */
-	mincore_count = s->mincore_buf_size > 64 ? 64 : s->mincore_buf_size;
+	mincore_count = s->mincore_buf_size > 128 ? 128 : s->mincore_buf_size;
 
 	i_page = 0;
 	n_pages_found_resident = 0;
