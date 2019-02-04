@@ -9,7 +9,7 @@
 static inline void refresh_page(void *map, size_t i_page, size_t page_size)
 {
 	char *p = &((char*)map)[i_page * page_size];
-	asm volatile("prefetcht0 %0" : : "m" (p[page_size * 8]));
+	/* asm volatile("prefetcht0 %0" : : "m" (p[page_size * 8])); */
 	asm volatile("movq %0, %%r11" : :
 		"m" (*p) : "r11");
 	/* asm volatile("movntdqa %0, %%xmm0" : : */
