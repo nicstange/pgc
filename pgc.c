@@ -42,24 +42,6 @@ static const struct option longopts[] = {
 
 static const char optstring[] = ":r:d:f:Rqwca:t:p:Tv:Vh";
 
-static size_t resident_set_size;
-static const char **resident_set_directories;
-static const char *resident_set_fillup_file;
-static size_t n_resident_set_directories;
-static bool map_resident_exec;
-static bool refresh_only_resident;
-static bool launch_resident_rewarmer;
-static bool rt_sched_refresher;
-
-static const char *transient_pool_file;
-static unsigned long transient_refill_period_usec;
-static bool map_transient_exec;
-
-static size_t non_evictable_set_size;
-
-static const char *victim_file;
-static bool map_victim_exec;
-
 static int parse_set_size(const char *s, size_t *res)
 {
 	unsigned long long size;
@@ -225,7 +207,50 @@ static int set_size_overflow_err(char **err_msg, char opt)
 
 static void show_help(void)
 {
-	/* TODO: to be filled */
+	printf("Usage: " ME " OPTION...\n\n");
+
+	printf("General options:\n");
+	printf("-h, --help\t\t\t\tdisplay this help and exit\n");
+	printf("\n");
+	printf("Victim page eviction checker:\n");
+	printf("-v, --victim-file=FILE\t\t\t"
+	       "file whose first page to monitor for\n"
+	       "\t\t\t\t\tevictions\n");
+	printf("-V, --map-victim-executable\t\t"
+	       "map victim page executable\n");
+	printf("\n");
+	printf("Resident set keeper:\n");
+	printf("-r, --resident-set-size=SIZE\t\t"
+	       "target size for total of resident set\n"
+	       "\t\t\t\t\tcandidates\n");
+	printf("-d, --resident-set-direcory=DIR\t\t"
+	       "directory to scan for files with\n"
+	       "\t\t\t\t\tresident pages to use as resident set\n"
+	       "\t\t\t\t\tcandidates\n");
+	printf("-d, --resident-set-fillup-file=FILE\t"
+	       "file to fill up the resident set\n"
+	       "\t\t\t\t\tcandidates from\n");
+	printf("-q, --refresh-only-resident\t\t"
+	       "don't refresh non-resident pages\n");
+	printf("-w, --launch-resident-rewarmer\t\t"
+	       "schedule background IO to read\n"
+	       "\t\t\t\t\tnon-resident pages back in\n");
+	printf("-c, --rt-sched-refresher\t\t"
+	       "schedule residency refresher thread with\n"
+	       "\t\t\t\t\treal time priority\n");
+	printf("\n");
+	printf("Transient set pager:\n");
+	printf("-t, --transient-refill-period=TIME\t"
+	       "time interval to read one transient page\n"
+	       "\t\t\t\t\tin, i.e. inverse of read frequency\n");
+	printf("-p, --transient-pool-file=FILE\t\t"
+	       "file to read transient pages from\n");
+	printf("-T, --map-transient-executable\t\t"
+	       "map transient pages executable\n");
+	printf("\n");
+	printf("Anonymous memory hogger:\n");
+	printf("-a, --non-evictable-set-size=SIZE\t"
+	       "amount of anonymous memory to allocate\n");
 }
 
 static void non_evictable_fill(void *map, size_t size, size_t page_size)
@@ -246,9 +271,26 @@ int main(int argc, char *argv[])
 	int opt;
 	char *err_msg = NULL;
 
+	size_t resident_set_size = 0;
 	bool resident_set_size_given = false;
-	bool non_evictable_set_size_given = false;
+	const char **resident_set_directories = NULL;
+	const char *resident_set_fillup_file = NULL;
+	size_t n_resident_set_directories = 0;
+	bool map_resident_exec = false;
+	bool refresh_only_resident = false;
+	bool launch_resident_rewarmer = false;
+	bool rt_sched_refresher = false;
+
+	const char *transient_pool_file = NULL;
+	unsigned long transient_refill_period_usec = 0;
 	bool transient_refill_period_given = false;
+	bool map_transient_exec = false;
+
+	size_t non_evictable_set_size = 0;
+	bool non_evictable_set_size_given = false;
+
+	const char *victim_file = NULL;
+	bool map_victim_exec = 0;
 
 	unsigned long page_size;
 
@@ -444,7 +486,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (!resident_set_size_given &&
-	    !transient_pool_file &&
+	    !transient_refill_period_given &&
 	    !non_evictable_set_size_given &&
 	    !victim_file) {
 		r = set_err_msg(&err_msg,
@@ -465,10 +507,84 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if ((transient_pool_file && !transient_refill_period_given) ||
-	    (!transient_pool_file && transient_refill_period_given)) {
+	if (n_resident_set_directories && !resident_set_size_given) {
+		r = set_err_msg(&err_msg,
+				"\"-d\" requires \"-r\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+	if (resident_set_fillup_file && !resident_set_size_given) {
+		r = set_err_msg(&err_msg,
+				"\"-f\" requires \"-r\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+	if (map_resident_exec && !resident_set_size_given) {
+		r = set_err_msg(&err_msg,
+				"\"-R\" requires \"-r\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+	if (refresh_only_resident && !resident_set_size_given) {
+		r = set_err_msg(&err_msg,
+				"\"-q\" requires \"-r\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+	if (launch_resident_rewarmer && !resident_set_size_given) {
+		r = set_err_msg(&err_msg,
+				"\"-w\" requires \"-r\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+	if (rt_sched_refresher && !resident_set_size_given) {
+		r = set_err_msg(&err_msg,
+				"\"-c\" requires \"-r\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+	if (launch_resident_rewarmer && !refresh_only_resident) {
+		r = set_err_msg(&err_msg,
+				"\"-w\" requires \"-q\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+
+	if ((transient_refill_period_given && !transient_pool_file) ||
+	    (!transient_refill_period_given && transient_pool_file)) {
 		r = set_err_msg(&err_msg,
 				"either both or none of \"-t\" and \"-p\" must be given");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+	if (map_transient_exec && !transient_refill_period_given) {
+		r = set_err_msg(&err_msg,
+				"\"-T\" requires \"-t\"");
+		if (r) {
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+
+	if (map_victim_exec && !victim_file) {
+		r = set_err_msg(&err_msg,
+				"\"-V\" requires \"-v\"");
 		if (r) {
 			free(resident_set_directories);
 			return 2;
