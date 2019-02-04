@@ -228,7 +228,7 @@ static int resident_mapping_find_ranges(struct resident_mapping *m,
 	if (!remaining)
 		return 0;
 
-	size_t range_begin;
+	size_t range_begin = 0; /* silence -Wuninitialized */
 	bool in_resident_range = false;
 	do {
 		size_t cur_size =
