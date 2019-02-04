@@ -26,8 +26,8 @@ static const struct option longopts[] = {
 	{ "launch-resident-rewarmer", 0, NULL, 'w' },
 	{ "rt-sched-refresher", 0, NULL, 'c' },
 
-	{ "transient-pool-file", 1, NULL, 't' },
-	{ "transient-refill-period", 1, NULL, 'p' },
+	{ "transient-refill-period", 1, NULL, 't' },
+	{ "transient-pool-file", 1, NULL, 'p' },
 	{ "map-transient-executable", 0, NULL, 'T' },
 
 	{ "non-evictable-set-size", 1, NULL, 'a' },
@@ -352,22 +352,9 @@ int main(int argc, char *argv[])
 			break;
 
 		case 't':
-			if (transient_pool_file) {
-				r = set_err_msg(&err_msg,
-						"\"-t\" may be specified only once");
-				if (r) {
-					free(resident_set_directories);
-					return 2;
-				}
-			}
-			transient_pool_file = optarg;
-
-			break;
-
-		case 'p':
 			if (transient_refill_period_given) {
 				r = set_err_msg(&err_msg,
-						"\"-p\" may be specified only once");
+						"\"-t\" may be specified only once");
 				if (r) {
 					free(resident_set_directories);
 					return 2;
@@ -379,12 +366,12 @@ int main(int argc, char *argv[])
 					      &transient_refill_period_usec)) {
 				if (errno == EINVAL) {
 					r = set_err_msg(&err_msg,
-							"invalid time specification for \"-p\"");
+							"invalid time specification for \"-t\"");
 
 				} else {
 					/* ERANGE */
 					r = set_err_msg(&err_msg,
-							"argument of \"-p\" is too large");
+							"argument of \"-t\" is too large");
 				}
 
 				if (r) {
@@ -392,6 +379,19 @@ int main(int argc, char *argv[])
 					return 2;
 				}
 			}
+			break;
+
+		case 'p':
+			if (transient_pool_file) {
+				r = set_err_msg(&err_msg,
+						"\"-p\" may be specified only once");
+				if (r) {
+					free(resident_set_directories);
+					return 2;
+				}
+			}
+			transient_pool_file = optarg;
+
 			break;
 
 		case 'T':
