@@ -14,6 +14,7 @@
 #include "sigbus-fixup.h"
 #include "transient-pager.h"
 #include "victim-checker.h"
+#include "meminfo-stats.h"
 
 #define ME "pgc"
 
@@ -292,11 +293,14 @@ int main(int argc, char *argv[])
 	const char *victim_file = NULL;
 	bool map_victim_exec = 0;
 
+	bool launch_meminfo_reporter = false;
+
 	unsigned long page_size;
 
 	struct victim_checker_state vcs;
 	struct transient_pager_state tps;
 	struct resident_keeper_state rks;
+	struct meminfo_reporter_state mrs;
 	void *non_evictable_map = NULL;
 
 	opterr = 0;
@@ -591,6 +595,14 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (!resident_set_size_given && transient_refill_period_given) {
+		/*
+		 * The resident set refresher will report meminfo
+		 * stats already.
+		 */
+		launch_meminfo_reporter = true;
+	}
+
 	/*
 	 * Round up resident_set_size and non_evictable_set_size to
 	 * the next multiple of the page size.
@@ -632,11 +644,23 @@ int main(int argc, char *argv[])
 		return 2;
 	}
 
+	if (launch_meminfo_reporter) {
+		r = meminfo_reporter_state_init(&mrs, 500);
+		if (r) {
+			perror(ME);
+			sigbus_fixup_cleanup();
+			free(resident_set_directories);
+			return 2;
+		}
+	}
+
 	if (victim_file) {
 		r = victim_checker_state_init(&vcs, victim_file,
 					      map_victim_exec);
 		if (r) {
 			perror(ME);
+			if (launch_meminfo_reporter)
+				meminfo_reporter_state_cleanup(&mrs);
 			sigbus_fixup_cleanup();
 			free(resident_set_directories);
 			return 2;
@@ -651,6 +675,8 @@ int main(int argc, char *argv[])
 			perror(ME);
 			if (victim_file)
 				victim_checker_state_cleanup(&vcs);
+			if (launch_meminfo_reporter)
+				meminfo_reporter_state_cleanup(&mrs);
 			sigbus_fixup_cleanup();
 			free(resident_set_directories);
 			return 2;
@@ -673,6 +699,8 @@ int main(int argc, char *argv[])
 				transient_pager_state_cleanup(&tps);
 			if (victim_file)
 				victim_checker_state_cleanup(&vcs);
+			if (launch_meminfo_reporter)
+				meminfo_reporter_state_cleanup(&mrs);
 			sigbus_fixup_cleanup();
 			free(resident_set_directories);
 			return 2;
@@ -687,6 +715,8 @@ int main(int argc, char *argv[])
 					transient_pager_state_cleanup(&tps);
 				if (victim_file)
 					victim_checker_state_cleanup(&vcs);
+				if (launch_meminfo_reporter)
+					meminfo_reporter_state_cleanup(&mrs);
 				sigbus_fixup_cleanup();
 				free(resident_set_directories);
 				return 2;
@@ -707,6 +737,8 @@ int main(int argc, char *argv[])
 					transient_pager_state_cleanup(&tps);
 				if (victim_file)
 					victim_checker_state_cleanup(&vcs);
+				if (launch_meminfo_reporter)
+					meminfo_reporter_state_cleanup(&mrs);
 				sigbus_fixup_cleanup();
 				free(resident_set_directories);
 				return 2;
@@ -732,6 +764,8 @@ int main(int argc, char *argv[])
 				transient_pager_state_cleanup(&tps);
 			if (victim_file)
 				victim_checker_state_cleanup(&vcs);
+			if (launch_meminfo_reporter)
+				meminfo_reporter_state_cleanup(&mrs);
 			sigbus_fixup_cleanup();
 			free(resident_set_directories);
 			return 2;
@@ -753,6 +787,8 @@ int main(int argc, char *argv[])
 				transient_pager_state_cleanup(&tps);
 			if (victim_file)
 				victim_checker_state_cleanup(&vcs);
+			if (launch_meminfo_reporter)
+				meminfo_reporter_state_cleanup(&mrs);
 			sigbus_fixup_cleanup();
 			free(resident_set_directories);
 			return 2;
@@ -775,12 +811,37 @@ int main(int argc, char *argv[])
 			transient_pager_state_cleanup(&tps);
 			if (victim_file)
 				victim_checker_state_cleanup(&vcs);
+			if (launch_meminfo_reporter)
+				meminfo_reporter_state_cleanup(&mrs);
 			sigbus_fixup_cleanup();
 			free(resident_set_directories);
 			return 2;
 		}
 	}
 
+	if (launch_meminfo_reporter) {
+		if (meminfo_reporter_start(&mrs)) {
+			perror(ME);
+			if (non_evictable_map) {
+				munmap(non_evictable_map,
+				       non_evictable_set_size);
+			}
+			if (resident_set_size) {
+				resident_keeper_stop(&rks);
+				resident_keeper_state_cleanup(&rks);
+			}
+			if (transient_pool_file) {
+				transient_pager_stop(&tps);
+				transient_pager_state_cleanup(&tps);
+			}
+			if (victim_file)
+				victim_checker_state_cleanup(&vcs);
+			meminfo_reporter_state_cleanup(&mrs);
+			sigbus_fixup_cleanup();
+			free(resident_set_directories);
+			return 2;
+		}
+	}
 
 	r = 0;
 	if (victim_file) {
@@ -800,6 +861,10 @@ int main(int argc, char *argv[])
 	}
 
 out:
+	if (launch_meminfo_reporter) {
+		meminfo_reporter_stop(&mrs);
+		meminfo_reporter_state_cleanup(&mrs);
+	}
 	if (non_evictable_map)
 		munmap(non_evictable_map, non_evictable_set_size);
 	if (resident_set_size) {

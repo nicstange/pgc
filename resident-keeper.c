@@ -14,6 +14,7 @@
 #include "resident-keeper.h"
 #include "util.h"
 #include "sigbus-fixup.h"
+#include "meminfo-stats.h"
 
 struct dir_stack_entry
 {
@@ -989,6 +990,8 @@ static void *resident_keeper_refresh_proc(void *arg)
 			unsigned long avg_duration_ms;
 			size_t n_active_pages;
 			unsigned long avg_n_pages_found_resident;
+			unsigned long mi_pc_f_active = 0, mi_pc_f_inactive = 0,
+				      mi_free = 0;
 
 			avg_duration_ms =
 				(acc_duration_ms + (n_acc / 2)) / n_acc;
@@ -997,9 +1000,14 @@ static void *resident_keeper_refresh_proc(void *arg)
 			avg_n_pages_found_resident =
 				((acc_n_pages_found_resident + (n_acc / 2)) /
 				 n_acc);
-			printf("Refresh resident: %lums, active %lu, resident %lu\n",
+			meminfo_read_stats(NULL, &mi_free, NULL, NULL,
+					   &mi_pc_f_active, &mi_pc_f_inactive);
+			printf("Refresh resident: %lums, pool %lu, resident %lu; meminfo: active file %lu, inactive file %lu, free %lu\n",
 			       avg_duration_ms, n_active_pages,
-			       avg_n_pages_found_resident);
+			       avg_n_pages_found_resident,
+			       mi_pc_f_active / s->page_size,
+			       mi_pc_f_inactive / s->page_size,
+			       mi_free / s->page_size);
 
 			n_acc = 0;
 			acc_duration_ms = 0;
