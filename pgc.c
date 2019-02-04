@@ -228,7 +228,7 @@ static void show_help(void)
 	       "directory to scan for files with\n"
 	       "\t\t\t\t\tresident pages to use as resident set\n"
 	       "\t\t\t\t\tcandidates\n");
-	printf("-d, --resident-set-fillup-file=FILE\t"
+	printf("-f, --resident-set-fillup-file=FILE\t"
 	       "file to fill up the resident set\n"
 	       "\t\t\t\t\tcandidates from\n");
 	printf("-q, --refresh-only-resident\t\t"
