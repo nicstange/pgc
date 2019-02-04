@@ -140,17 +140,26 @@ int transient_pager_state_init(struct transient_pager_state *s,
 		size += s->page_size - 1;
 	size &= ~((size_t)s->page_size - 1);
 
+	s->size = size;
 	s->n_pages = size / s->page_size;
 
 	s->map = mmap(NULL, size,
 		      PROT_READ | (map_exec ? PROT_EXEC : 0),
-		      MAP_SHARED, fd, 0);
+		      MAP_PRIVATE, fd, 0);
 	if (s->map == MAP_FAILED) {
 		close(fd);
 		return -1;
 	}
 
 	close(fd);
+
+	if (madvise(s->map, s->size, MADV_RANDOM | MADV_DONTDUMP)) {
+		munmap(s->map, s->size);
+		s->map = NULL;
+		return -1;
+	}
+
+
 
 	return 0;
 }
