@@ -723,10 +723,13 @@ int resident_keeper_set_fillup_file(struct resident_keeper_state *s,
 	return 0;
 }
 
-static void try_add_rewarm_page(struct resident_keeper_state *s, void *p)
+static void try_add_rewarm_pages(struct resident_keeper_state *s, void **pages,
+				 size_t n_pages)
 {
 	int r;
 	size_t pos, used;
+	size_t i;
+	bool wakeup_rewarmer;
 
 	if (!s->launch_rewarmer)
 		return;
@@ -744,15 +747,19 @@ static void try_add_rewarm_page(struct resident_keeper_state *s, void *p)
 		return;
 	}
 
-	pos = s->rewarm_ring_pos + used;
-	if (pos >= s->rewarm_ring_size)
-		pos -= s->rewarm_ring_size;
+	wakeup_rewarmer = !used;
 
-	s->rewarm_ring[pos] = p;
-	++used;
+	pos = s->rewarm_ring_pos + used;
+	for (i = 0; i < n_pages && used != s->rewarm_ring_size;
+	     ++i, ++pos, ++used) {
+		if (pos == s->rewarm_ring_size)
+			pos -= s->rewarm_ring_size;
+		s->rewarm_ring[pos] = pages[i];
+	}
 	s->rewarm_ring_used = used;
 	pthread_spin_unlock(&s->rewarm_ring_lock);
-	if (used != 1)
+
+	if (!wakeup_rewarmer)
 		return;
 
 	r = pthread_mutex_lock(&s->rewarmer_wake_mtx);
@@ -828,6 +835,8 @@ static size_t refresh_range(struct resident_keeper_state *s,
 	size_t i_page;
 	size_t n_pages_found_resident;
 	void *map = (char *)m->map + rr->offset;
+	void *pages_to_rewarm[128];
+	size_t n_pages_to_rewarm;
 
 	if (n_pages > rr->n_pages)
 		n_pages = rr->n_pages;
@@ -845,6 +854,7 @@ static size_t refresh_range(struct resident_keeper_state *s,
 		size_t _i_page;
 		int r;
 
+		n_pages_to_rewarm = 0;
 		n_pages_in_batch = (mincore_count < n_pages
 				    ? mincore_count : n_pages);
 		_i_page = i_page;
@@ -867,13 +877,17 @@ static size_t refresh_range(struct resident_keeper_state *s,
 						     s->page_size);
 					++n_pages_found_resident;
 				} else {
-					try_add_rewarm_page
-						(s,
-						 ((char *)map +
-						  (_i_page + i_page_in_batch) *
-						  s->page_size));
+					pages_to_rewarm[n_pages_to_rewarm] =
+						((char *)map +
+						 (_i_page + i_page_in_batch) *
+						 s->page_size);
+					n_pages_to_rewarm++;
 				}
 			}
+
+			if (n_pages_to_rewarm)
+				try_add_rewarm_pages(s, pages_to_rewarm,
+						     n_pages_to_rewarm);
 
 		} else {
 			for (i_page_in_batch = 0;
