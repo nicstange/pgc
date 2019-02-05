@@ -1,0 +1,125 @@
+pgc - File page cache stresser
+==============================
+pgc has been written in order to gain a better understanding of the
+mechanisms involved in page cache attacks a la CVE-2019-5489
+(c.f. [1]).
+
+Page cache attacks consist of two steps: the victim page eviction and
+the refault probing. The focus here is on the first part, i.e. studying
+the effects of certain workloads on victim page eviction efficiency.
+
+pgc consists of four independent components:
+1. A victim page eviction detector,
+2. a transient set pager,
+3. a resident page set keeper,
+4. an anonymous memory "blocker".
+
+The victim page eviction detector mmap()s the first page from a file
+("-v file") of your choice, optionally with PROT_EXEC ("-V"). During
+operation, that page will get repeatedly paged in and the time until
+eviction measured afterwards. Eviction is probed my means of
+mincore(). Inbetween two repetitions, the thread is paused for one
+second in order to be in line with the experimental methods used in
+[1]. Note that this delay is quite arbitrary and, depending on the
+system's memory size and the current workload, the victim page might
+get classified as "refaulted" by the Linux kernel and thus, cause it
+to get inserted to the head of the active LRU.
+Important note: on page-in, the victim page will be added to the
+per-CPU LRU lists and it can sit there forever if that CPU is
+otherwise idle. If that happens, you'll see unexpectedly large
+eviction times and a very high variance. In order to avoid this
+situation, confine the main thread (which does the eviction
+measurements) onto the same CPU as one or more of the worker
+threads, c.f. the examples below.
+
+
+The purpose of the transient pager is to stream file data through the
+page cache at a specified rate. In order to ensure "streaming"
+properties, the source file ("-p file") should be twice as large as
+the available memory and filled with random data. The rate is
+specified as the time period ("-t time") in which one page access
+shall be carried out. If you want to get the maximal throughput, use a
+value like "0us" or (tested) "1us".  Like for the victim page, the
+transient pager source file can, at your option, get mapped with
+PROT_EXEC ("-T").
+
+
+The resident page set keeper tries to keep the pages from a certain
+set resident by repeatedly accessing them. This set's target size is
+specified by the user ("-r size") and it gets filled at startup from
+two sources.  First, the regular files in some (possibly empty) list
+of directories ("-d DIR1 -d DIR2 ...")  are scanned for pages already
+resident and these are added to the set until the target size has been
+reached. Files with many resident pages are favoured over files with
+fewer ones in case the limit is actually met. Also, a particular inode
+(as identified by the pair of ->st_dev and ->st_ino) is never added
+more than once. After these already resident pages have been added to
+the set, it is filled up to the specified target size with pages from
+some "fillup file" ("-f file"). That fillup file should, similar to
+the transient pager's source file, consist of random data and be large
+enough to satisfy any resident set target size ever specified. At the
+user's option, the pages from the resident set can again get mapped
+with PROT_EXEC ("-R").
+
+The resident page set keeper is implemented by repeatedly accessing
+the first few bytes of all resident set pages from a dedicated thread.
+However, despite all efforts, this thread is likely to encounter a
+reclaimed page at some point and while it is waiting for its refault,
+even more pages of the resident set can happen to get reclaimed. Once
+trapped in this state, the resident keeper will never recover and this
+in turn means, that the resident set keeper effectively gets degraded
+to an IO thread from then on, very similar to the transient pager from
+above. In order to avoid this situation and actually keep a
+significant portion of the resident set resident, the resident keeper
+can be made ("-q") to query each page's state by means of mincore()
+and skip over the non-resident ones. Of course, this implies that the
+resident set would shrink continuously over time. The resident keeper
+can be made to queue the pages found non-resident for page-in from a
+different IO thread ("-w"). It turns out in practice, that for a
+system operating in a low memory condition, this thread manages to
+saturate the underlying disk's bandwidth quite well and that a
+transient pager is not needed.
+
+
+Finally, the anonymous memory "blocker" component simply allocates a
+specified amound of memory and fills it with some random data.
+
+
+Example 1:
+----------
+Evict with a transient pager workload.
+
+One time setup:
+# dd if=/dev/urandom of=/mnt/scratch/trans.data bs=1M count=16384
+
+Optionally get the system in a defined state:
+# sync; echo 3 > /proc/sys/vm/drop_caches
+
+And run the eviction workload:
+# taskset -c 2 \
+# ./pgc -a 7 GB -t 1us -p /mnt/scratch/trans.data -T -v /mnt/scratch/victim
+
+
+Example 2:
+----------
+Evict with a resident set keeper workload.
+
+One time setup:
+# dd if=/dev/urandom of=/mnt/scratch/res.data bs=1M count=8192
+
+Optionally get the system in a defined state:
+# sync; echo 3 > /proc/sys/vm/drop_caches
+
+And run the eviction workload:
+# taskset -c 2-3 \
+# ./pgc -a 7 GB -r 1GB -f /mnt/scratch/res.data -R -q -w -v /mnt/scratch/victim
+
+Alternatively, to keep the currently resident pages hot and not
+disturb the system too much:
+# taskset -c 2-3 \
+# ./pgc -a 7 GB -r 1GB							    \
+#	-d /bin -d /home -d /lib -d /lib64 -d /sbin -d /tmp -d /usr -d /var \
+#	-f /mnt/scratch/res.data -R -q -w -v /mnt/scratch/victim
+
+
+[1] https://arxiv.org/abs/1901.01161 ("Page Cache Attacks")
