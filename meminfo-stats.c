@@ -117,7 +117,7 @@ static void* meminfo_reporter_proc(void *arg)
 {
 	struct meminfo_reporter_state *s = (struct meminfo_reporter_state *)arg;
 
-	pthread_setcancelstate(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 
 	while (1) {
 		unsigned long mi_pc_f_active = 0, mi_pc_f_inactive = 0,
